@@ -14,6 +14,8 @@
 #include <chrono>
 #include <iomanip>
 #include <cstring>
+#include <algorithm>
+#include <random>
 
 // ============================================================================
 // HYPER-TRANSFER v2.0 - High-Performance Multi-threaded Sender
@@ -241,75 +243,127 @@ void dedup_thread(
 // ============================================================================
 // Pipeline Stage: Sender (Main Thread)
 // ============================================================================
+
+/**
+ * @brief Serialize and write a single ProcessedChunk to stdout.
+ */
+void write_chunk(const ProcessedChunk& chunk,
+                 hyper::Compressor& compressor,
+                 std::vector<char>& output_buffer,
+                 PipelineStats& stats)
+{
+    output_buffer.clear();
+
+    if (chunk.is_duplicate) {
+        HyperHeader header = make_header(
+            TYPE_DEDUP_HASH,
+            chunk.offset,
+            sizeof(uint64_t),
+            static_cast<uint32_t>(chunk.data.size())
+        );
+        output_buffer.resize(sizeof(HyperHeader) + sizeof(uint64_t));
+        std::memcpy(output_buffer.data(), &header, sizeof(HyperHeader));
+        std::memcpy(output_buffer.data() + sizeof(HyperHeader), &chunk.hash, sizeof(uint64_t));
+
+        std::cout.write(output_buffer.data(), static_cast<std::streamsize>(output_buffer.size()));
+        stats.bytes_sent += output_buffer.size();
+    } else {
+        try {
+            auto compressed = compressor.compress(chunk.data.data(), chunk.data.size());
+
+            HyperHeader header = make_header(
+                TYPE_LZ4_DATA,
+                chunk.offset,
+                static_cast<uint32_t>(compressed.compressed_size),
+                static_cast<uint32_t>(chunk.data.size())
+            );
+
+            size_t total_size = sizeof(HyperHeader) + compressed.compressed_size;
+            output_buffer.resize(total_size);
+            std::memcpy(output_buffer.data(), &header, sizeof(HyperHeader));
+            std::memcpy(output_buffer.data() + sizeof(HyperHeader),
+                       compressed.data.data(), compressed.compressed_size);
+
+            std::cout.write(output_buffer.data(), static_cast<std::streamsize>(total_size));
+            stats.bytes_sent += total_size;
+            stats.bytes_compressed += compressed.compressed_size;
+        } catch (const hyper::CompressionError& e) {
+            std::cerr << "[SENDER] Compression error: " << e.what() << "\n";
+        }
+    }
+}
+
 void sender_main(
     hyper::SafeQueue<ProcessedChunk>& send_queue,
     std::atomic<bool>& dedup_done,
-    PipelineStats& stats)
+    PipelineStats& stats,
+    bool shuffle_mode)
 {
     hyper::Compressor compressor(hyper::CompressionLevel::FAST);
-    
-    // Combined buffer for atomic writes (header + payload)
     std::vector<char> output_buffer;
-    output_buffer.reserve(8 * 1024 * 1024);  // 8 MB buffer
-    
-    ProcessedChunk chunk;
-    while (true) {
-        if (!send_queue.pop_with_timeout(chunk, 100)) {
-            if (dedup_done && send_queue.empty()) {
-                break;
+    output_buffer.reserve(8 * 1024 * 1024);
+
+    if (shuffle_mode) {
+        // ── Shuffle mode: collect all chunks, randomize order, then send ──
+        std::cerr << "[SENDER] *** SHUFFLE-TEST MODE: collecting all chunks before sending ***\n";
+        std::vector<ProcessedChunk> all_chunks;
+        all_chunks.reserve(4096);
+
+        ProcessedChunk chunk;
+        while (true) {
+            if (!send_queue.pop_with_timeout(chunk, 100)) {
+                if (dedup_done && send_queue.empty()) break;
+                continue;
             }
-            continue;
+            all_chunks.push_back(std::move(chunk));
         }
-        
-        output_buffer.clear();
-        
-        if (chunk.is_duplicate) {
-            // Send DEDUP_HASH packet (hash only, no data)
-            HyperHeader header = make_header(
-                TYPE_DEDUP_HASH,
-                chunk.offset,
-                sizeof(uint64_t),           // Payload is the hash
-                static_cast<uint32_t>(chunk.data.size())  // Original size
-            );
-            
-            // Combine header + hash into single buffer for atomic write
-            output_buffer.resize(sizeof(HyperHeader) + sizeof(uint64_t));
-            std::memcpy(output_buffer.data(), &header, sizeof(HyperHeader));
-            std::memcpy(output_buffer.data() + sizeof(HyperHeader), &chunk.hash, sizeof(uint64_t));
-            
-            std::cout.write(output_buffer.data(), static_cast<std::streamsize>(output_buffer.size()));
-            
-            stats.bytes_sent += output_buffer.size();
-        } else {
-            // Compress and send DATA packet
-            try {
-                auto compressed = compressor.compress(chunk.data.data(), chunk.data.size());
-                
-                HyperHeader header = make_header(
-                    TYPE_LZ4_DATA,
-                    chunk.offset,
-                    static_cast<uint32_t>(compressed.compressed_size),
-                    static_cast<uint32_t>(chunk.data.size())
-                );
-                
-                // Combine header + compressed data into single buffer for atomic write
-                size_t total_size = sizeof(HyperHeader) + compressed.compressed_size;
-                output_buffer.resize(total_size);
-                std::memcpy(output_buffer.data(), &header, sizeof(HyperHeader));
-                std::memcpy(output_buffer.data() + sizeof(HyperHeader), 
-                           compressed.data.data(), compressed.compressed_size);
-                
-                std::cout.write(output_buffer.data(), static_cast<std::streamsize>(total_size));
-                
-                stats.bytes_sent += total_size;
-                stats.bytes_compressed += compressed.compressed_size;
-                
-            } catch (const hyper::CompressionError& e) {
-                std::cerr << "[SENDER] Compression error: " << e.what() << "\n";
+
+        std::cerr << "[SENDER] Collected " << all_chunks.size()
+                  << " chunks, shuffling...\n";
+
+        // Fisher-Yates shuffle with fixed seed for reproducibility
+        std::mt19937 rng(42);
+        std::shuffle(all_chunks.begin(), all_chunks.end(), rng);
+
+        // But we must ensure unique chunks are sent BEFORE their duplicates,
+        // otherwise receiver's dedup_cache won't have the data yet.
+        // Strategy: partition into uniques-first, then duplicates (both shuffled).
+        std::vector<ProcessedChunk> uniques, duplicates;
+        for (auto& c : all_chunks) {
+            if (c.is_duplicate) {
+                duplicates.push_back(std::move(c));
+            } else {
+                uniques.push_back(std::move(c));
             }
+        }
+        all_chunks.clear();
+
+        // Shuffle each partition independently
+        std::shuffle(uniques.begin(), uniques.end(), rng);
+        std::shuffle(duplicates.begin(), duplicates.end(), rng);
+
+        std::cerr << "[SENDER] Sending " << uniques.size()
+                  << " unique chunks (shuffled), then "
+                  << duplicates.size() << " duplicate chunks (shuffled)\n";
+
+        for (const auto& c : uniques) {
+            write_chunk(c, compressor, output_buffer, stats);
+        }
+        for (const auto& c : duplicates) {
+            write_chunk(c, compressor, output_buffer, stats);
+        }
+    } else {
+        // ── Normal streaming mode ──
+        ProcessedChunk chunk;
+        while (true) {
+            if (!send_queue.pop_with_timeout(chunk, 100)) {
+                if (dedup_done && send_queue.empty()) break;
+                continue;
+            }
+            write_chunk(chunk, compressor, output_buffer, stats);
         }
     }
-    
+
     std::cout.flush();
     std::cerr << "[SENDER] Done. Total sent: " << stats.bytes_sent.load() << " bytes\n";
 }
@@ -336,12 +390,22 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     if (argc < 2) {
         std::cerr << "HYPER-TRANSFER v2.0 Multi-threaded Sender\n";
-        std::cerr << "Usage: " << argv[0] << " <input_file_path>\n";
+        std::cerr << "Usage: " << argv[0] << " <input_file_path> [--shuffle-test]\n";
         std::cerr << "\nPipeline: Reader -> Chunker -> Dedup -> Sender -> stdout\n";
+        std::cerr << "  --shuffle-test  Shuffle chunk send order to test pwrite resilience\n";
         return 1;
     }
     
     const std::string file_path = argv[1];
+    
+    // Check for --shuffle-test flag
+    bool shuffle_mode = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--shuffle-test") {
+            shuffle_mode = true;
+        }
+    }
+    
     size_t file_size = get_file_size(file_path);
     
     if (file_size == 0) {
@@ -358,6 +422,9 @@ int main(int argc, char* argv[]) {
               << std::fixed << std::setprecision(2) 
               << (file_size / (1024.0 * 1024.0)) << " MB)\n";
     std::cerr << "  Read Block: " << (READ_BLOCK_SIZE / 1024 / 1024) << " MB\n";
+    if (shuffle_mode) {
+        std::cerr << "  Mode: *** SHUFFLE-TEST (乱序重放) ***\n";
+    }
     std::cerr << "════════════════════════════════════════════════════════════\n";
     
     // Create queues
@@ -400,7 +467,7 @@ int main(int argc, char* argv[]) {
                       std::ref(stats));
     
     // Sender runs on main thread
-    sender_main(send_queue, dedup_done, stats);
+    sender_main(send_queue, dedup_done, stats, shuffle_mode);
     
     // Wait for all threads
     reader.join();

@@ -3,9 +3,11 @@
 
 #include <iostream>
 #include <vector>
+#include <unordered_map>
 #include <cstring>
 #include <chrono>
 #include <iomanip>
+#include <xxhash.h>
 
 // POSIX headers for low-level I/O
 #include <fcntl.h>
@@ -107,6 +109,10 @@ int main(int argc, char* argv[]) {
     // Initialize components
     // ========================================================================
     hyper::Compressor decompressor(hyper::CompressionLevel::FAST);
+
+    // Dedup cache: hash -> original chunk data
+    std::unordered_map<uint64_t, std::vector<char>> dedup_cache;
+    dedup_cache.reserve(16384);
     
     // Buffers for reading
     std::vector<char> header_buf(sizeof(HyperHeader));
@@ -207,6 +213,9 @@ int main(int argc, char* argv[]) {
                 error_count++;
                 continue;  // Try to continue with next packet
             }
+            // Compute hash for dedup cache (must match sender's XXH3)
+            uint64_t hash = XXH3_64bits(decompressed.data.data(), decompressed.size);
+            dedup_cache.emplace(hash, decompressed.data);
             
             // ----------------------------------------------------------------
             // Step 5: Write to file at exact offset using pwrite()
@@ -240,9 +249,55 @@ int main(int argc, char* argv[]) {
             }
             
         } else if (header.type == TYPE_DEDUP_HASH) {
-            // Deduplication: payload contains hash, lookup data from cache
-            // TODO: Implement dedup cache lookup
-            std::cerr << "[DEDUP] Hash packet received (not implemented yet)\n";
+            // Deduplication: payload contains hash, fetch original chunk from cache
+            if (header.length != sizeof(uint64_t)) {
+                std::cerr << "\n[ERROR] DEDUP packet has unexpected length: "
+                          << header.length << "\n";
+                error_count++;
+                continue;
+            }
+
+            uint64_t hash = 0;
+            std::memcpy(&hash, compressed_buf.data(), sizeof(uint64_t));
+
+            auto it = dedup_cache.find(hash);
+            if (it == dedup_cache.end()) {
+                std::cerr << "\n[ERROR] DEDUP hash not found in cache: 0x"
+                          << std::hex << hash << std::dec << "\n";
+                error_count++;
+                continue;
+            }
+
+            const auto& cached = it->second;
+            if (cached.size() != header.original_length) {
+                std::cerr << "\n[WARN] DEDUP size mismatch: header="
+                          << header.original_length << " cached="
+                          << cached.size() << "\n";
+            }
+
+            ssize_t written = ::pwrite(
+                fd,
+                cached.data(),
+                cached.size(),
+                static_cast<off_t>(header.offset)
+            );
+
+            if (written < 0) {
+                std::cerr << "\n[ERROR] pwrite() failed for DEDUP at offset "
+                          << header.offset << ": " << strerror(errno) << "\n";
+                error_count++;
+                continue;
+            }
+
+            total_bytes_written += static_cast<size_t>(written);
+
+            size_t end_offset = header.offset + cached.size();
+            if (end_offset > max_offset_seen) {
+                max_offset_seen = end_offset;
+            }
+
+            std::cerr << "\n[DEDUP] Reused cached chunk hash=0x" << std::hex << hash
+                      << std::dec << " at offset " << header.offset << "\n";
         }
         
         total_packets++;

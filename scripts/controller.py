@@ -82,7 +82,8 @@ class TransferConfig:
     dry_run: bool
     timeout: int
     parallel_streams: int
-    router_path: Optional[str] = None  # Path to hyper_router binary
+    gridftp_port: int = 2811             # GridFTP server port
+    router_path: Optional[str] = None    # Path to hyper_router binary
 
 
 class HyperController:
@@ -388,6 +389,16 @@ class HyperController:
             return host_spec.split("@", 1)[1]
         return host_spec
     
+    def _gsi_env(self) -> dict:
+        """Return environment variables needed for GSI operations."""
+        home = os.path.expanduser("~")
+        env = os.environ.copy()
+        env.setdefault("X509_USER_CERT", f"{home}/.globus/usercert.pem")
+        env.setdefault("X509_USER_KEY", f"{home}/.globus/userkey.pem")
+        env.setdefault("X509_CERT_DIR", f"{home}/.globus/certificates")
+        env.setdefault("GRIDMAP", f"{home}/.gridmap")
+        return env
+
     def ensure_gsi_proxy(self) -> bool:
         """
         Ensure a valid GSI proxy exists for GridFTP authentication.
@@ -404,6 +415,8 @@ class HyperController:
             self.log(LogLevel.INFO, "[DRY-RUN] Would check/initialize GSI proxy")
             return True
         
+        gsi_env = self._gsi_env()
+        
         # Check if a valid proxy already exists
         try:
             result = subprocess.run(
@@ -411,7 +424,8 @@ class HyperController:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=10
+                timeout=10,
+                env=gsi_env
             )
             
             if result.returncode == 0:
@@ -422,7 +436,8 @@ class HyperController:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=10
+                    timeout=10,
+                    env=gsi_env
                 )
                 if info_result.returncode == 0:
                     for line in info_result.stdout.strip().split('\n'):
@@ -446,7 +461,8 @@ class HyperController:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=gsi_env
             )
             
             if result.returncode == 0:
@@ -479,32 +495,34 @@ class HyperController:
     
     def execute_transfer(self) -> bool:
         """
-        Execute the third-party transfer using globus-url-copy with GSI authentication.
+        Execute third-party GridFTP transfer between two remote GridFTP servers.
         
-        Uses gsiftp:// protocol with certificate-based authentication.
-        Source: file://<local_pipe> (local named pipe)
-        Destination: gsiftp://<host>:2811<remote_pipe> (GridFTP server on port 2811)
+        Uses gsiftp:// protocol on BOTH sides for true third-party transfer:
+          gsiftp://<Node_A_FQDN>:2811/pipe_in -> gsiftp://<Node_B_FQDN>:2811/pipe_out
+        
+        The controller node orchestrates the transfer without touching data itself.
+        Both nodes must be running globus-gridftp-server.
         """
         # Ensure we have a valid GSI proxy
         if not self.ensure_gsi_proxy():
             return False
         
-        self.log(LogLevel.INFO, "Starting authenticated GridFTP transfer...")
+        self.log(LogLevel.INFO, "Starting third-party authenticated GridFTP transfer...")
         
-        # Build URLs:
-        # - Source: local file/pipe using file:// protocol
-        # - Destination: remote GridFTP server using gsiftp:// protocol
-        src_url = f"file://{self.src_pipe}"
-        
-        # Extract just the host (without user@) for gsiftp URL
+        # Build gsiftp:// URLs for BOTH sides (true third-party transfer)
+        src_host = self._extract_host(self.config.src_host)
         dst_host = self._extract_host(self.config.dst_host)
-        dst_url = f"gsiftp://{dst_host}:2811{self.dst_pipe}"
+        
+        gridftp_port = self.config.gridftp_port
+        src_url = f"gsiftp://{src_host}:{gridftp_port}{self.src_pipe}"
+        dst_url = f"gsiftp://{dst_host}:{gridftp_port}{self.dst_pipe}"
         
         # Build globus-url-copy command
         guc_cmd = [
             "globus-url-copy",
             "-vb",                                  # Verbose with progress bar
-            "-p", str(self.config.parallel_streams),  # Parallel streams (default 4)
+            "-p", str(self.config.parallel_streams), # Parallel streams (default 4)
+            "-tcp-bs", "4194304",                    # 4MB TCP buffer for throughput
             src_url,
             dst_url
         ]
@@ -521,12 +539,14 @@ class HyperController:
         
         try:
             # Run globus-url-copy and capture both stdout and stderr
+            gsi_env = self._gsi_env()
             result = subprocess.run(
                 guc_cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.config.timeout
+                timeout=self.config.timeout,
+                env=gsi_env
             )
             
             elapsed = time.time() - start_time
@@ -807,6 +827,12 @@ Examples:
         dest="router_path",
         help="Path to hyper_router binary (default: {binary_dir}/hyper_router)"
     )
+    parser.add_argument(
+        "--gridftp-port",
+        type=int,
+        default=2811,
+        help="GridFTP server port on both nodes (default: 2811)"
+    )
     
     args = parser.parse_args()
     
@@ -822,6 +848,7 @@ Examples:
         dry_run=args.dry_run,
         timeout=args.timeout,
         parallel_streams=args.parallel,
+        gridftp_port=args.gridftp_port,
         router_path=args.router_path
     )
     

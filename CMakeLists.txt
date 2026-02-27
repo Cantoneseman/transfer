@@ -47,7 +47,7 @@ add_executable(hyper_receiver
     src/hyper_receiver.cpp
     src/compressor.cpp
 )
-target_link_libraries(hyper_receiver PRIVATE ${LZ4_LIBRARIES})
+target_link_libraries(hyper_receiver PRIVATE ${LZ4_LIBRARIES} ${XXHASH_LIBRARY})
 if(LZ4_INCLUDE_DIRS)
     target_include_directories(hyper_receiver PRIVATE ${LZ4_INCLUDE_DIRS})
 endif()
