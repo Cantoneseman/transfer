@@ -1,0 +1,24 @@
+# Build artifacts
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Binaries and archives
+*.o
+*.a
+*.so
+*.exe
+
+# Test data and large binaries
+*.bin
+*.deb
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+
+# OS files
+.DS_Store
